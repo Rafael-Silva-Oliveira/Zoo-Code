@@ -50,9 +50,11 @@ import {
 	DEFAULT_CHECKPOINT_TIMEOUT_SECONDS,
 	getModelId,
 	isRetiredProvider,
+	providerIdentifiers,
 } from "@roo-code/types"
 import { RateLimitClock, createRateLimitClock } from "../task/RateLimitClock"
 import { TaskRegistry } from "../task/TaskRegistry"
+import { TaskScheduler } from "../task/TaskScheduler"
 import { aggregateTaskCostsRecursive, type AggregatedCosts } from "./aggregateTaskCosts"
 import { TelemetryService } from "@roo-code/telemetry"
 import { CloudService, getRooCodeApiUrl } from "@roo-code/cloud"
@@ -143,13 +145,19 @@ function runDelegationTransition<T>(
 
 	locks.set(parentTaskId, tail)
 
-	tail.finally(() => {
+	void tail.finally(() => {
 		if (locks.get(parentTaskId) === tail) {
 			locks.delete(parentTaskId)
 		}
 	})
 
 	return current
+}
+
+function scheduleTask(scheduler: TaskScheduler, task: Task, source: string): void {
+	void scheduler
+		.schedule(task, () => task.run())
+		.catch((error) => console.error(`[${source}] taskScheduler.schedule failed:`, error))
 }
 
 export class ClineProvider
@@ -166,6 +174,7 @@ export class ClineProvider
 	private webviewDisposables: vscode.Disposable[] = []
 	private view?: vscode.WebviewView | vscode.WebviewPanel
 	private taskRegistry = new TaskRegistry()
+	private taskScheduler = new TaskScheduler()
 	private delegationTransitionLocks?: Map<string, Promise<void>>
 	private cancelledDelegationChildIds = new Set<string>()
 	private codeIndexStatusSubscription?: vscode.Disposable
@@ -227,7 +236,7 @@ export class ClineProvider
 		ClineProvider.activeInstances.add(this)
 
 		this.mdmService = mdmService
-		this.updateGlobalState("codebaseIndexModels", EMBEDDING_MODEL_PROFILES)
+		void this.updateGlobalState("codebaseIndexModels", EMBEDDING_MODEL_PROFILES)
 
 		// Initialize the per-task file-based history store.
 		// The globalState write-through is debounced separately (not on every mutation)
@@ -479,7 +488,7 @@ export class ClineProvider
 	async performPreparationTasks(cline: Task) {
 		// LMStudio: We need to force model loading in order to read its context
 		// size; we do it now since we're starting a task with that model selected.
-		if (cline.apiConfiguration && cline.apiConfiguration.apiProvider === "lmstudio") {
+		if (cline.apiConfiguration && cline.apiConfiguration.apiProvider === providerIdentifiers.lmstudio) {
 			try {
 				if (!hasLoadedFullDetails(cline.apiConfiguration.lmStudioModelId!)) {
 					await forceFullModelDetailsLoad(
@@ -682,6 +691,10 @@ export class ClineProvider
 		this._disposed = true
 		this.log("Disposing ClineProvider...")
 
+		// Reject any tasks still waiting for a scheduler permit so they don't
+		// hold the event loop after the provider is torn down.
+		this.taskScheduler.cancelQueued()
+
 		// Clear all tasks from the stack. The first pop goes through evictCurrentTask()
 		// so an active delegated child is marked interrupted before the extension shuts down,
 		// rather than being left persisted as "active" across the reload.
@@ -724,7 +737,7 @@ export class ClineProvider
 		this.mcpHub = undefined
 		await this.skillsManager?.dispose()
 		this.skillsManager = undefined
-		this.marketplaceManager?.cleanup()
+		await this.marketplaceManager?.cleanup()
 		this.customModesManager?.dispose()
 		this.taskHistoryStore.dispose()
 		this.flushGlobalStateWriteThrough()
@@ -859,9 +872,27 @@ export class ClineProvider
 			setPanel(webviewView, "sidebar")
 		}
 
+		// Set up webview options with proper resource roots
+		const resourceRoots = [this.contextProxy.extensionUri]
+
+		// Add workspace folders to allow access to workspace files
+		if (vscode.workspace.workspaceFolders) {
+			resourceRoots.push(...vscode.workspace.workspaceFolders.map((folder) => folder.uri))
+		}
+
+		webviewView.webview.options = {
+			enableScripts: true,
+			localResourceRoots: resourceRoots,
+		}
+
+		webviewView.webview.html =
+			this.contextProxy.extensionMode === vscode.ExtensionMode.Development
+				? await this.getHMRHtmlContent(webviewView.webview)
+				: await this.getHtmlContent(webviewView.webview)
+
 		// Initialize out-of-scope variables that need to receive persistent
 		// global state values.
-		this.getState().then(
+		await this.getState().then(
 			({
 				terminalShellIntegrationTimeout = Terminal.defaultShellIntegrationTimeout,
 				terminalShellIntegrationDisabled = false,
@@ -889,24 +920,6 @@ export class ClineProvider
 			},
 		)
 
-		// Set up webview options with proper resource roots
-		const resourceRoots = [this.contextProxy.extensionUri]
-
-		// Add workspace folders to allow access to workspace files
-		if (vscode.workspace.workspaceFolders) {
-			resourceRoots.push(...vscode.workspace.workspaceFolders.map((folder) => folder.uri))
-		}
-
-		webviewView.webview.options = {
-			enableScripts: true,
-			localResourceRoots: resourceRoots,
-		}
-
-		webviewView.webview.html =
-			this.contextProxy.extensionMode === vscode.ExtensionMode.Development
-				? await this.getHMRHtmlContent(webviewView.webview)
-				: await this.getHtmlContent(webviewView.webview)
-
 		// Sets up an event listener to listen for messages passed from the webview view context
 		// and executes code based on the message that is received.
 		this.setWebviewMessageListener(webviewView.webview)
@@ -929,7 +942,7 @@ export class ClineProvider
 			// for this visibility listener panel.
 			const viewStateDisposable = webviewView.onDidChangeViewState(() => {
 				if (this.view?.visible) {
-					this.postMessageToWebview({ type: "action", action: "didBecomeVisible" })
+					void this.postMessageToWebview({ type: "action", action: "didBecomeVisible" })
 				} else {
 					this.logWebviewHiddenDiagnostics()
 				}
@@ -940,7 +953,7 @@ export class ClineProvider
 			// sidebar
 			const visibilityDisposable = webviewView.onDidChangeVisibility(() => {
 				if (this.view?.visible) {
-					this.postMessageToWebview({ type: "action", action: "didBecomeVisible" })
+					void this.postMessageToWebview({ type: "action", action: "didBecomeVisible" })
 				} else {
 					this.logWebviewHiddenDiagnostics()
 				}
@@ -1007,7 +1020,7 @@ export class ClineProvider
 		// Using .find() would miss stale tokens in duplicate/renamed profiles since handleZooCodeCallback
 		// uses .filter() and updates all of them — the early-return guard must match.
 		const allProfiles = await this.providerSettingsManager.listConfig()
-		const zooGatewayProfiles = allProfiles.filter((p) => p.apiProvider === "zoo-gateway")
+		const zooGatewayProfiles = allProfiles.filter((p) => p.apiProvider === providerIdentifiers.zooGateway)
 
 		if (zooGatewayProfiles.length === 0) {
 			this.log("[ensureZooGatewayProfileSeeded] No zoo-gateway profile found, creating one")
@@ -1181,7 +1194,7 @@ export class ClineProvider
 			taskNumber: historyItem.number,
 			workspacePath: historyItem.workspace,
 			onCreated: this.taskCreationCallback,
-			startTask: options?.startTask ?? true,
+			startTask: false,
 			// Preserve the status from the history item to avoid overwriting it when the task saves messages
 			initialStatus: historyItem.status,
 			rateLimitClock: this.rateLimitClock,
@@ -1221,12 +1234,20 @@ export class ClineProvider
 			this.log(
 				`[createTaskWithHistoryItem] rehydrated task ${task.taskId}.${task.instanceId} in-place (flicker-free)`,
 			)
+
+			if (options?.startTask !== false) {
+				scheduleTask(this.taskScheduler, task, "createTaskWithHistoryItem")
+			}
 		} else {
 			await this.addClineToStack(task)
 
 			this.log(
 				`[createTaskWithHistoryItem] ${task.parentTask ? "child" : "parent"} task ${task.taskId}.${task.instanceId} instantiated`,
 			)
+
+			if (options?.startTask !== false) {
+				scheduleTask(this.taskScheduler, task, "createTaskWithHistoryItem")
+			}
 		}
 
 		// Check if there's a pending edit after checkpoint restoration
@@ -1378,7 +1399,7 @@ export class ClineProvider
 						window.AUDIO_BASE_URI = "${audioUri}"
 						window.MATERIAL_ICONS_BASE_URI = "${materialIconsUri}"
 					</script>
-					<title>Roo Code</title>
+					<title>Zoo Code</title>
 				</head>
 				<body>
 					<div id="root"></div>
@@ -1457,7 +1478,7 @@ export class ClineProvider
 				window.AUDIO_BASE_URI = "${audioUri}"
 				window.MATERIAL_ICONS_BASE_URI = "${materialIconsUri}"
 			</script>
-            <title>Roo Code</title>
+            <title>Zoo Code</title>
           </head>
           <body>
             <noscript>You need to enable JavaScript to run this app.</noscript>
@@ -1868,14 +1889,14 @@ export class ClineProvider
 
 			// Check if Zoo Gateway is the currently active profile by apiProvider identity,
 			// not by profile name (profile names are user-renameable).
-			const isZooGatewayActive = currentSettings.apiProvider === "zoo-gateway"
+			const isZooGatewayActive = currentSettings.apiProvider === providerIdentifiers.zooGateway
 
 			// Always scan ALL profiles and update every zoo-gateway profile with the new token.
 			// This ensures renamed profiles, duplicate profiles, and inactive profiles all stay
 			// in sync. The model lookup in requestRouterModels uses .find() which returns the
 			// first zoo-gateway profile it finds — if that profile has a stale token, requests fail.
 			const allProfiles = await this.providerSettingsManager.listConfig()
-			const zooProfiles = allProfiles.filter((p) => p.apiProvider === "zoo-gateway")
+			const zooProfiles = allProfiles.filter((p) => p.apiProvider === providerIdentifiers.zooGateway)
 
 			if (zooProfiles.length === 0) {
 				// No existing zoo-gateway profile — create the canonical default.
@@ -2138,7 +2159,7 @@ export class ClineProvider
 		const state = await this.getStateToPostToWebview()
 		this.clineMessagesSeq++
 		state.clineMessagesSeq = this.clineMessagesSeq
-		this.postMessageToWebview({ type: "state", state })
+		await this.postMessageToWebview({ type: "state", state })
 	}
 
 	/**
@@ -2154,7 +2175,7 @@ export class ClineProvider
 		this.clineMessagesSeq++
 		state.clineMessagesSeq = this.clineMessagesSeq
 		const { taskHistory: _omit, ...rest } = state
-		this.postMessageToWebview({ type: "state", state: rest })
+		await this.postMessageToWebview({ type: "state", state: rest })
 	}
 
 	/**
@@ -2171,7 +2192,7 @@ export class ClineProvider
 	async postStateToWebviewWithoutClineMessages(): Promise<void> {
 		const state = await this.getStateToPostToWebview()
 		const { clineMessages: _omitMessages, taskHistory: _omitHistory, ...rest } = state
-		this.postMessageToWebview({ type: "state", state: rest })
+		await this.postMessageToWebview({ type: "state", state: rest })
 	}
 
 	/**
@@ -2191,7 +2212,7 @@ export class ClineProvider
 			])
 
 			// Send marketplace data separately
-			this.postMessageToWebview({
+			await this.postMessageToWebview({
 				type: "marketplaceData",
 				organizationMcps: marketplaceResult.organizationMcps || [],
 				marketplaceItems: marketplaceResult.marketplaceItems || [],
@@ -2202,7 +2223,7 @@ export class ClineProvider
 			console.error("Failed to fetch marketplace data:", error)
 
 			// Send empty data on error to prevent UI from hanging
-			this.postMessageToWebview({
+			await this.postMessageToWebview({
 				type: "marketplaceData",
 				organizationMcps: [],
 				marketplaceItems: [],
@@ -3001,7 +3022,7 @@ export class ClineProvider
 				if (currentManager === this.getCurrentWorkspaceCodeIndexManager()) {
 					// Get the full status from the manager to ensure we have all fields correctly formatted
 					const fullStatus = currentManager.getCurrentStatus()
-					this.postMessageToWebview({
+					void this.postMessageToWebview({
 						type: "indexingStatusUpdate",
 						values: fullStatus,
 					})
@@ -3013,7 +3034,7 @@ export class ClineProvider
 			}
 
 			// Send initial status for the current workspace
-			this.postMessageToWebview({
+			void this.postMessageToWebview({
 				type: "indexingStatusUpdate",
 				values: currentManager.getCurrentStatus(),
 			})
@@ -3185,7 +3206,7 @@ export class ClineProvider
 
 		await this.addClineToStack(task)
 		if (options.startTask !== false) {
-			task.start()
+			scheduleTask(this.taskScheduler, task, "createTask")
 		}
 
 		this.log(
@@ -3697,7 +3718,7 @@ export class ClineProvider
 		}
 
 		// 6) Start the child task now that parent metadata is safely persisted.
-		child.start()
+		scheduleTask(this.taskScheduler, child, "delegateParentAndOpenChild")
 
 		// 7) Emit TaskDelegated (provider-level)
 		try {
