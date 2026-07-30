@@ -4021,14 +4021,16 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		const state = await this.providerRef.deref()?.getState()
 
 		const {
-			apiConfiguration,
 			autoApprovalEnabled,
 			requestDelaySeconds,
-			mode,
 			autoCondenseContext = true,
 			autoCondenseContextPercent = 100,
 			profileThresholds = {},
 		} = state ?? {}
+		// mode/apiConfiguration come from this task's own fields, not shared
+		// provider state — see getSystemPrompt() for why.
+		const mode = await this.getTaskMode()
+		const apiConfiguration = this.apiConfiguration
 
 		// Get condensing configuration for automatic triggers.
 		const customCondensingPrompt = state?.customSupportPrompts?.CONDENSE
