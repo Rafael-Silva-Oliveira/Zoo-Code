@@ -203,10 +203,36 @@ export class ClineProvider
 	private globalStateWriteThroughTimer: ReturnType<typeof setTimeout> | null = null
 	private static readonly GLOBAL_STATE_WRITE_THROUGH_DEBOUNCE_MS = 5000 // 5 seconds
 	private static readonly PENDING_OPERATION_TIMEOUT_MS = 30000 // 30 seconds
+	private providerProfileMutationQueue = Promise.resolve()
 
 	private runDelegationTransition<T>(parentTaskId: string, fn: () => Promise<T>): Promise<T> {
 		this.delegationTransitionLocks ??= new Map()
 		return runDelegationTransition(this.delegationTransitionLocks, parentTaskId, fn)
+	}
+
+	private enqueueProviderProfileMutation<T>(fn: () => Promise<T>): Promise<T> {
+		const run = this.providerProfileMutationQueue.then(fn, fn)
+		const callerResult = this.withProviderProfileMutationTimeout(run)
+		this.providerProfileMutationQueue = run.then(
+			() => undefined,
+			() => undefined,
+		)
+		return callerResult
+	}
+
+	private withProviderProfileMutationTimeout<T>(operation: Promise<T>): Promise<T> {
+		let timeoutId: ReturnType<typeof setTimeout> | undefined
+		const timeout = new Promise<never>((_, reject) => {
+			timeoutId = setTimeout(() => {
+				reject(new Error("Provider profile mutation timed out"))
+			}, ClineProvider.PENDING_OPERATION_TIMEOUT_MS)
+		})
+
+		return Promise.race([operation, timeout]).finally(() => {
+			if (timeoutId) {
+				clearTimeout(timeoutId)
+			}
+		})
 	}
 	private readonly pendingEditOperations: PendingEditOperationStore
 
@@ -1535,6 +1561,10 @@ export class ClineProvider
 	 *   `newMode` is the child's requested mode.
 	 */
 	public async handleModeSwitch(newMode: Mode, targetTask: Task | null | undefined = this.getCurrentTask()) {
+		return this.enqueueProviderProfileMutation(() => this.handleModeSwitchUnlocked(newMode, targetTask))
+	}
+
+	private async handleModeSwitchUnlocked(newMode: Mode, targetTask: Task | null | undefined): Promise<void> {
 		const task = targetTask
 
 		if (task) {
@@ -1572,7 +1602,14 @@ export class ClineProvider
 		// If workspace lock is on, keep the current API config — don't load mode-specific config
 		const lockApiConfigAcrossModes = this.context.workspaceState.get("lockApiConfigAcrossModes", false)
 		if (lockApiConfigAcrossModes) {
-			await this.postStateToWebview()
+			// Skip in fan-out (targetTask === null): postStateToWebview() reads
+			// getCurrentTask(), which is still the live parent here (the child
+			// doesn't exist yet) — pushing now would flash the parent's
+			// clineMessages/taskId to the webview as "current". The child's own
+			// registration moments later triggers the correct push.
+			if (targetTask !== null) {
+				await this.postStateToWebview()
+			}
 			return
 		}
 
@@ -1598,7 +1635,18 @@ export class ClineProvider
 				const hasActualSettings = !!fullProfile.apiProvider
 
 				if (hasActualSettings) {
-					await this.activateProviderProfile({ name: profile.name })
+					// targetTask === null means this call came from delegation fan-out
+					// (see handleModeSwitch's targetTask doc) — the parent is still
+					// "current" here and must not have its live API handler rebuilt
+					// to the child's mode's saved profile.
+					if (targetTask === null) {
+						await this.activateProviderProfileUnlocked(
+							{ name: profile.name },
+							{ skipCurrentTaskRebuild: true },
+						)
+					} else {
+						await this.activateProviderProfileUnlocked({ name: profile.name })
+					}
 				} else {
 					// The task will continue with the current/default configuration.
 				}
@@ -1618,7 +1666,9 @@ export class ClineProvider
 			}
 		}
 
-		await this.postStateToWebview()
+		if (targetTask !== null) {
+			await this.postStateToWebview()
+		}
 	}
 
 	// Provider Profile Management
@@ -1634,8 +1684,9 @@ export class ClineProvider
 	 */
 	private updateTaskApiHandlerIfNeeded(
 		providerSettings: ProviderSettings,
-		options: { forceRebuild?: boolean } = {},
+		options: { forceRebuild?: boolean; skipCurrentTaskRebuild?: boolean } = {},
 	): void {
+		if (options.skipCurrentTaskRebuild) return
 		const task = this.getCurrentTask()
 		if (!task) return
 
@@ -1751,7 +1802,13 @@ export class ClineProvider
 		await this.postStateToWebview()
 	}
 
-	private async persistStickyProviderProfileToCurrentTask(apiConfigName: string): Promise<void> {
+	private async persistStickyProviderProfileToCurrentTask(
+		apiConfigName: string,
+		options: { skipCurrentTaskRebuild?: boolean } = {},
+	): Promise<void> {
+		if (options.skipCurrentTaskRebuild) {
+			return
+		}
 		const task = this.getCurrentTask()
 		if (!task) {
 			return
@@ -1781,12 +1838,35 @@ export class ClineProvider
 
 	async activateProviderProfile(
 		args: { name: string } | { id: string },
-		options?: { persistModeConfig?: boolean; persistTaskHistory?: boolean },
+		options?: {
+			persistModeConfig?: boolean
+			persistTaskHistory?: boolean
+			/**
+			 * Skip rebuilding/mutating the current task's API handler and sticky
+			 * profile. Used by delegation fan-out mode switches, where the
+			 * "current" task is still the live parent (the child doesn't exist
+			 * yet) and must not have its API configuration swapped to the
+			 * child's mode's saved profile.
+			 */
+			skipCurrentTaskRebuild?: boolean
+		},
 	) {
+		return this.enqueueProviderProfileMutation(() => this.activateProviderProfileUnlocked(args, options))
+	}
+
+	private async activateProviderProfileUnlocked(
+		args: { name: string } | { id: string },
+		options?: {
+			persistModeConfig?: boolean
+			persistTaskHistory?: boolean
+			skipCurrentTaskRebuild?: boolean
+		},
+	): Promise<void> {
 		const { name, id, ...providerSettings } = await this.providerSettingsManager.activateProfile(args)
 
 		const persistModeConfig = options?.persistModeConfig ?? true
 		const persistTaskHistory = options?.persistTaskHistory ?? true
+		const skipCurrentTaskRebuild = options?.skipCurrentTaskRebuild ?? false
 
 		// See `upsertProviderProfile` for a description of what this is doing.
 		await Promise.all([
@@ -1802,17 +1882,27 @@ export class ClineProvider
 		}
 
 		// Change the provider for the current task.
-		this.updateTaskApiHandlerIfNeeded(providerSettings, { forceRebuild: true })
+		this.updateTaskApiHandlerIfNeeded(providerSettings, { forceRebuild: true, skipCurrentTaskRebuild })
 
 		// Update the current task's sticky provider profile, unless this activation is
 		// being used purely as a non-persisting restoration (e.g., reopening a task from history).
 		if (persistTaskHistory) {
-			await this.persistStickyProviderProfileToCurrentTask(name)
+			await this.persistStickyProviderProfileToCurrentTask(name, { skipCurrentTaskRebuild })
 		}
 
-		await this.postStateToWebview()
+		// Same fan-out hazard as handleModeSwitch: postStateToWebview() reads
+		// getCurrentTask(), which is still the live parent while skipCurrentTaskRebuild
+		// is set, so pushing here would flash the parent's clineMessages/taskId to
+		// the webview as "current" a moment before the child registers itself.
+		if (!skipCurrentTaskRebuild) {
+			await this.postStateToWebview()
+		}
 
-		if (providerSettings.apiProvider) {
+		// In fan-out, ProviderProfileChanged would be received by the still-running
+		// parent task and make it reload the child's provider settings through its
+		// own listener. The child is created from the updated provider state, so no
+		// live-task event is needed for that path.
+		if (providerSettings.apiProvider && !skipCurrentTaskRebuild) {
 			this.emit(RooCodeEventName.ProviderProfileChanged, { name, provider: providerSettings.apiProvider })
 		}
 	}
@@ -3547,6 +3637,48 @@ export class ClineProvider
 	}
 
 	/**
+	 * Undo the "parent kept running" (fan-out) or "parent evicted" (non-fan-out)
+	 * side effect from step 3 of `delegateParentAndOpenChild`, for failures that
+	 * happen before a child exists to attach lineage to. Shared by the
+	 * `createTask()` failure path and the metadata-persistence failure path.
+	 */
+	private async restoreParentOrReleasePermit(
+		parentTaskId: string,
+		fanOut: boolean,
+		childReservedRelease: (() => void) | undefined,
+	): Promise<void> {
+		if (!fanOut) {
+			try {
+				const { historyItem: parentHistory } = await this.getTaskWithId(parentTaskId)
+				await this.createTaskWithHistoryItem(parentHistory)
+			} catch (firstRollbackError) {
+				this.log(
+					`[delegateParentAndOpenChild] Failed to restore parent ${parentTaskId} during rollback, retrying once: ${
+						(firstRollbackError as Error)?.message ?? String(firstRollbackError)
+					}`,
+				)
+				try {
+					const { historyItem: parentHistory } = await this.getTaskWithId(parentTaskId)
+					await this.createTaskWithHistoryItem(parentHistory)
+				} catch (rollbackError) {
+					this.log(
+						`[delegateParentAndOpenChild] Failed to restore parent ${parentTaskId} during rollback retry: ${
+							(rollbackError as Error)?.message ?? String(rollbackError)
+						}`,
+					)
+					vscode.window.showErrorMessage(
+						"Failed to restore the parent task after subtask creation failed. Reopen the task from history to continue.",
+					)
+				}
+			}
+		} else {
+			// The child never reached step 6, so the reserved permit must be
+			// released here or it leaks for the lifetime of the scheduler.
+			childReservedRelease?.()
+		}
+	}
+
+	/**
 	 * Delegate parent task and open child task.
 	 *
 	 * - Enforce single-open invariant, unless fan-out (maxConcurrency > 1 with a
@@ -3661,6 +3793,10 @@ export class ClineProvider
 					(e as Error)?.message ?? String(e)
 				}`,
 			)
+			if (fanOut) {
+				await this.restoreParentOrReleasePermit(parentTaskId, fanOut, childReservedRelease)
+				throw e
+			}
 		}
 
 		// 4) Create and focus child, preserving parent reference for lineage.
@@ -3676,11 +3812,24 @@ export class ClineProvider
 		// Without this, the child's fire-and-forget startTask() races with step 5,
 		// and the last writer to globalState overwrites the other's changes—
 		// causing the parent's delegation fields to be lost.
-		const child = await this.createTask(message, undefined, parent as any, {
-			initialTodos,
-			initialStatus: "active",
-			startTask: false,
-		})
+		let child: Task
+		try {
+			child = await this.createTask(message, undefined, parent as any, {
+				initialTodos,
+				initialStatus: "active",
+				startTask: false,
+			})
+		} catch (err) {
+			this.log(
+				`[delegateParentAndOpenChild] createTask failed for parent ${parentTaskId}: ${
+					(err as Error)?.message ?? String(err)
+				}`,
+			)
+			// No child was created, so there is no lineage to unwind — just undo
+			// step 3's parent-eviction (or release the reserved permit in fan-out).
+			await this.restoreParentOrReleasePermit(parentTaskId, fanOut, childReservedRelease)
+			throw err
+		}
 
 		// createTask() -> addClineToStack() -> taskRegistry.push() already focuses
 		// the child. In the fan-out case the parent remains in the registry
@@ -3777,22 +3926,7 @@ export class ClineProvider
 			// still focused, removeClineFromStack() above already re-focused the
 			// registry onto the parent (TaskRegistry.remove only reassigns focus
 			// when the removed task was current).
-			if (!fanOut) {
-				try {
-					const { historyItem: parentHistory } = await this.getTaskWithId(parentTaskId)
-					await this.createTaskWithHistoryItem(parentHistory)
-				} catch (rollbackError) {
-					this.log(
-						`[delegateParentAndOpenChild] Failed to restore parent ${parentTaskId} during rollback: ${
-							(rollbackError as Error)?.message ?? String(rollbackError)
-						}`,
-					)
-				}
-			} else {
-				// The child never reached step 6, so the reserved permit must be
-				// released here or it leaks for the lifetime of the scheduler.
-				childReservedRelease?.()
-			}
+			await this.restoreParentOrReleasePermit(parentTaskId, fanOut, childReservedRelease)
 			throw err
 		}
 

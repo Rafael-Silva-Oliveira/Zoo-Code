@@ -16,6 +16,7 @@ import {
 import { TelemetryService } from "@roo-code/telemetry"
 
 import { Task } from "../Task"
+import { SYSTEM_PROMPT } from "../../prompts/system"
 import { createRateLimitClock } from "../RateLimitClock"
 import { summarizeConversation } from "../../condense"
 import { ClineProvider } from "../../webview/ClineProvider"
@@ -211,6 +212,15 @@ vi.mock("../../condense", async (importOriginal) => {
 			cost: 0,
 			newContextTokens: 1,
 		}),
+	}
+})
+// Spy on SYSTEM_PROMPT's mode argument without changing its behavior for tests
+// that mock getSystemPrompt() at a higher level and never reach this call.
+vi.mock("../../prompts/system", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("../../prompts/system")>()
+	return {
+		...actual,
+		SYSTEM_PROMPT: vi.fn(actual.SYSTEM_PROMPT),
 	}
 })
 // Mock storagePathManager to prevent dynamic import issues.
@@ -438,6 +448,65 @@ describe("Cline", () => {
 			expect(() => {
 				new Task({ provider: mockProvider, apiConfiguration: mockApiConfig })
 			}).toThrow("Either historyItem or task/images must be provided")
+		})
+	})
+
+	describe("getSystemPrompt mode/apiConfiguration isolation", () => {
+		// Regression test for delegation fan-out (Story 3.2b): a parent task must
+		// keep using its own mode and apiConfiguration even while shared provider
+		// state has moved on to reflect a concurrently-running child (e.g. during
+		// delegateParentAndOpenChild's fan-out window, before the child registers
+		// itself as current). Reading provider.getState().mode/apiConfiguration
+		// directly — instead of the task's own fields — would leak the child's
+		// mode/config into the parent's next system prompt.
+		it("uses the task's own mode, not provider.getState().mode, when they diverge", async () => {
+			mockProvider.getState = vi.fn().mockResolvedValue({ mode: "architect" })
+
+			const cline = new Task({
+				provider: mockProvider,
+				apiConfiguration: mockApiConfig,
+				task: "test task",
+				startTask: false,
+			})
+			await cline.getTaskMode()
+
+			// Simulate a concurrently-running child having switched shared provider
+			// state to a different mode (what handleModeSwitch does today).
+			mockProvider.getState = vi.fn().mockResolvedValue({ mode: "code" })
+
+			await getTaskTestAccess(cline).getSystemPrompt()
+
+			expect(cline.taskMode).toBe("architect")
+			const [, , , , , modeArg] = vi.mocked(SYSTEM_PROMPT).mock.calls.at(-1)!
+			expect(modeArg).toBe("architect")
+		})
+
+		it("uses the task's own apiConfiguration, not provider.getState().apiConfiguration, when they diverge", async () => {
+			const parentApiConfig: ProviderSettings = {
+				...mockApiConfig,
+				todoListEnabled: true,
+			}
+
+			const cline = new Task({
+				provider: mockProvider,
+				apiConfiguration: parentApiConfig,
+				task: "test task",
+				startTask: false,
+			})
+			await cline.getTaskMode()
+
+			// Simulate shared provider state now reflecting a different task's
+			// (the child's) apiConfiguration — opposite todoListEnabled value so
+			// a leak is directly observable in SYSTEM_PROMPT's settings argument.
+			mockProvider.getState = vi.fn().mockResolvedValue({
+				mode: "code",
+				apiConfiguration: { ...mockApiConfig, todoListEnabled: false },
+			})
+
+			await getTaskTestAccess(cline).getSystemPrompt()
+
+			const [, , , , , , , , , , , , settingsArg] = vi.mocked(SYSTEM_PROMPT).mock.calls.at(-1)!
+			expect((settingsArg as { todoListEnabled?: boolean }).todoListEnabled).toBe(true)
 		})
 	})
 
@@ -681,7 +750,7 @@ describe("Cline", () => {
 					async return() {
 						return { done: true, value: undefined }
 					},
-					async throw(e: any) {
+					async throw(e: unknown) {
 						throw e
 					},
 					async [Symbol.asyncDispose]() {
@@ -700,7 +769,7 @@ describe("Cline", () => {
 					async return() {
 						return { done: true, value: undefined }
 					},
-					async throw(e: any) {
+					async throw(e: unknown) {
 						throw e
 					},
 					async [Symbol.asyncDispose]() {
@@ -772,6 +841,83 @@ describe("Cline", () => {
 					async return() {
 						return { done: true, value: undefined }
 					},
+					async throw(e: unknown) {
+						throw e
+					},
+					async [Symbol.asyncDispose]() {},
+				} as AsyncGenerator<ApiStreamChunk>
+
+				const mockSuccessStream = {
+					async *[Symbol.asyncIterator]() {
+						yield { type: "text", text: "Success" }
+					},
+					async next() {
+						return { done: true, value: { type: "text", text: "Success" } }
+					},
+					async return() {
+						return { done: true, value: undefined }
+					},
+					async throw(e: unknown) {
+						throw e
+					},
+					async [Symbol.asyncDispose]() {},
+				} as AsyncGenerator<ApiStreamChunk>
+
+				let firstAttempt = true
+				vi.spyOn(cline.api, "createMessage").mockImplementation(() => {
+					if (firstAttempt) {
+						firstAttempt = false
+						return mockFailedStream
+					}
+					return mockSuccessStream
+				})
+				const providerState = await mockProvider.getState()
+				vi.spyOn(mockProvider, "getState").mockResolvedValue({
+					...providerState,
+					apiConfiguration: rateLimitConfig,
+					autoApprovalEnabled: true,
+					requestDelaySeconds: 3,
+				})
+
+				const iterator = cline.attemptApiRequest(0)
+				await iterator.next()
+
+				// rateLimitSeconds=10 > exponentialDelay=ceil(3*2^0)=3, so
+				// finalDelay=10 and the countdown loop fires delay(1000) ten times.
+				expect(mockDelay).toHaveBeenCalledWith(1000)
+				expect(mockDelay).toHaveBeenCalledTimes(10)
+				expect(clock.getLastRequestTime()).toBeDefined()
+			})
+
+			it("uses the task's own rate limit for retry backoff when provider state belongs to another task", async () => {
+				const clock = createRateLimitClock()
+				const cline = new Task({
+					provider: mockProvider,
+					apiConfiguration: {
+						...mockApiConfig,
+						rateLimitSeconds: 4,
+					},
+					task: "test task",
+					startTask: false,
+					rateLimitClock: clock,
+				})
+				vi.spyOn(getTaskTestAccess(cline), "getSystemPrompt").mockResolvedValue("mock system prompt")
+
+				const mockDelay = vi.fn().mockResolvedValue(undefined)
+				vi.spyOn(await import("delay"), "default").mockImplementation(mockDelay)
+
+				const mockError = new Error("API Error")
+				const mockFailedStream = {
+					// eslint-disable-next-line require-yield
+					async *[Symbol.asyncIterator]() {
+						throw mockError
+					},
+					async next() {
+						throw mockError
+					},
+					async return() {
+						return { done: true, value: undefined }
+					},
 					async throw(e: any) {
 						throw e
 					},
@@ -805,19 +951,18 @@ describe("Cline", () => {
 				const providerState = await mockProvider.getState()
 				vi.spyOn(mockProvider, "getState").mockResolvedValue({
 					...providerState,
-					apiConfiguration: rateLimitConfig,
+					apiConfiguration: {
+						...mockApiConfig,
+						rateLimitSeconds: 10,
+					},
 					autoApprovalEnabled: true,
-					requestDelaySeconds: 3,
+					requestDelaySeconds: 1,
 				})
 
 				const iterator = cline.attemptApiRequest(0)
 				await iterator.next()
 
-				// rateLimitSeconds=10 > exponentialDelay=ceil(3*2^0)=3, so
-				// finalDelay=10 and the countdown loop fires delay(1000) ten times.
-				expect(mockDelay).toHaveBeenCalledWith(1000)
-				expect(mockDelay).toHaveBeenCalledTimes(10)
-				expect(clock.getLastRequestTime()).toBeDefined()
+				expect(mockDelay).toHaveBeenCalledTimes(4)
 			})
 
 			it("should not apply retry delay twice", async () => {

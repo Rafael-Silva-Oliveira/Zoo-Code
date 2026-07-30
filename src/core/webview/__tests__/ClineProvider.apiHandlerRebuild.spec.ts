@@ -3,9 +3,10 @@
 import * as vscode from "vscode"
 
 import { TelemetryService } from "@roo-code/telemetry"
-import { getModelId } from "@roo-code/types"
+import { getModelId, RooCodeEventName } from "@roo-code/types"
 
 import { ContextProxy } from "../../config/ContextProxy"
+import type { Mode } from "../../../shared/modes"
 import { Task, TaskOptions } from "../../task/Task"
 import { ClineProvider } from "../ClineProvider"
 
@@ -235,6 +236,7 @@ describe("ClineProvider - API Handler Rebuild Guard", () => {
 					{ name: "test-config", id: "test-id", apiProvider: "openrouter", modelId: "openai/gpt-4" },
 				]),
 			setModeConfig: vi.fn(),
+			getModeConfigId: vi.fn().mockResolvedValue(undefined),
 			activateProfile: vi.fn().mockResolvedValue({
 				name: "test-config",
 				id: "test-id",
@@ -410,6 +412,158 @@ describe("ClineProvider - API Handler Rebuild Guard", () => {
 	})
 
 	describe("activateProviderProfile", () => {
+		test("serializes provider profile mutations without interleaving", async () => {
+			const events: string[] = []
+			let resolveFirst!: () => void
+
+			provider["providerSettingsManager"].activateProfile = vi
+				.fn()
+				.mockImplementationOnce(async () => {
+					events.push("first:start")
+					await new Promise<void>((resolve) => {
+						resolveFirst = resolve
+					})
+					events.push("first:end")
+					return {
+						name: "first-profile",
+						id: "first-id",
+						apiProvider: "openrouter",
+						openRouterModelId: "openai/gpt-4",
+					}
+				})
+				.mockImplementationOnce(async () => {
+					events.push("second:start")
+					return {
+						name: "second-profile",
+						id: "second-id",
+						apiProvider: "openrouter",
+						openRouterModelId: "openai/gpt-4.1-mini",
+					}
+				})
+
+			const first = provider.activateProviderProfile({ name: "first-profile" })
+			const second = provider.activateProviderProfile({ name: "second-profile" })
+
+			await Promise.resolve()
+			expect(events).toEqual(["first:start"])
+
+			resolveFirst()
+			await first
+			await second
+
+			expect(events).toEqual(["first:start", "first:end", "second:start"])
+		})
+
+		test("provider profile mutation rejection does not poison later queued mutations", async () => {
+			const firstError = new Error("first profile failed")
+
+			provider["providerSettingsManager"].activateProfile = vi
+				.fn()
+				.mockRejectedValueOnce(firstError)
+				.mockResolvedValueOnce({
+					name: "second-profile",
+					id: "second-id",
+					apiProvider: "openrouter",
+					openRouterModelId: "openai/gpt-4.1-mini",
+				})
+
+			await expect(provider.activateProviderProfile({ name: "first-profile" })).rejects.toThrow(firstError)
+			await expect(provider.activateProviderProfile({ name: "second-profile" })).resolves.toBeUndefined()
+		})
+
+		test("provider profile mutation timeout does not advance the queue until the timed-out mutation settles", async () => {
+			vi.useFakeTimers()
+			try {
+				const events: string[] = []
+				let resolveFirst!: () => void
+				provider["providerSettingsManager"].activateProfile = vi
+					.fn()
+					.mockImplementationOnce(async () => {
+						events.push("first:start")
+						await new Promise<void>((resolve) => {
+							resolveFirst = resolve
+						})
+						events.push("first:end")
+						return {
+							name: "stuck-profile",
+							id: "stuck-id",
+							apiProvider: "openrouter",
+							openRouterModelId: "openai/gpt-4",
+						}
+					})
+					.mockImplementationOnce(async () => {
+						events.push("second:start")
+						return {
+							name: "second-profile",
+							id: "second-id",
+							apiProvider: "openrouter",
+							openRouterModelId: "openai/gpt-4.1-mini",
+						}
+					})
+
+				const first = provider.activateProviderProfile({ name: "stuck-profile" })
+				const firstResult = first.catch((error: unknown) => error)
+				await Promise.resolve()
+				expect(events).toEqual(["first:start"])
+
+				await vi.advanceTimersByTimeAsync(30_000)
+
+				expect(await firstResult).toEqual(new Error("Provider profile mutation timed out"))
+				const second = provider.activateProviderProfile({ name: "second-profile" })
+				await Promise.resolve()
+				expect(events).toEqual(["first:start"])
+
+				resolveFirst()
+				await second
+				expect(events).toEqual(["first:start", "first:end", "second:start"])
+			} finally {
+				vi.useRealTimers()
+			}
+		})
+
+		test("skipCurrentTaskRebuild does not rebuild current task or emit profile-change event", async () => {
+			const mockTask = new Task({
+				...defaultTaskOptions,
+				apiConfiguration: {
+					apiProvider: "openrouter",
+					openRouterModelId: "openai/gpt-4",
+				},
+			})
+			await provider.addClineToStack(mockTask)
+
+			provider["providerSettingsManager"].activateProfile = vi.fn().mockResolvedValue({
+				name: "ask-profile",
+				id: "ask-id",
+				apiProvider: "openrouter",
+				openRouterModelId: "openai/gpt-4.1-mini",
+			})
+			const emitSpy = vi.spyOn(provider, "emit")
+
+			await provider.activateProviderProfile({ name: "ask-profile" }, { skipCurrentTaskRebuild: true })
+
+			expect(mockTask.updateApiConfiguration).not.toHaveBeenCalled()
+			expect(emitSpy).not.toHaveBeenCalledWith(
+				RooCodeEventName.ProviderProfileChanged,
+				expect.objectContaining({ name: "ask-profile" }),
+			)
+		})
+
+		test("fan-out mode switch does not post the current parent state when no saved profile is activated", async () => {
+			const mockTask = new Task({
+				...defaultTaskOptions,
+				apiConfiguration: {
+					apiProvider: "openrouter",
+					openRouterModelId: "openai/gpt-4",
+				},
+			})
+			await provider.addClineToStack(mockTask)
+			const postStateSpy = vi.spyOn(provider, "postStateToWebview").mockResolvedValue(undefined)
+
+			await provider.handleModeSwitch("ask" as Mode, null)
+
+			expect(postStateSpy).not.toHaveBeenCalled()
+		})
+
 		test("calls updateApiConfiguration when provider/model unchanged but settings differ (explicit profile switch)", async () => {
 			const mockTask = new Task({
 				...defaultTaskOptions,
