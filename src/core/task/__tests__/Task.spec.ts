@@ -460,7 +460,7 @@ describe("Cline", () => {
 		// directly — instead of the task's own fields — would leak the child's
 		// mode/config into the parent's next system prompt.
 		it("uses the task's own mode, not provider.getState().mode, when they diverge", async () => {
-			mockProvider.getState = vi.fn().mockResolvedValue({ mode: "architect" })
+			mockProvider.getState = vi.fn().mockResolvedValue({ mode: "architect", mcpEnabled: false })
 
 			const cline = new Task({
 				provider: mockProvider,
@@ -472,7 +472,8 @@ describe("Cline", () => {
 
 			// Simulate a concurrently-running child having switched shared provider
 			// state to a different mode (what handleModeSwitch does today).
-			mockProvider.getState = vi.fn().mockResolvedValue({ mode: "code" })
+			mockProvider.getState = vi.fn().mockResolvedValue({ mode: "code", mcpEnabled: false })
+			vi.mocked(SYSTEM_PROMPT).mockResolvedValueOnce("mock system prompt")
 
 			await getTaskTestAccess(cline).getSystemPrompt()
 
@@ -500,8 +501,10 @@ describe("Cline", () => {
 			// a leak is directly observable in SYSTEM_PROMPT's settings argument.
 			mockProvider.getState = vi.fn().mockResolvedValue({
 				mode: "code",
+				mcpEnabled: false,
 				apiConfiguration: { ...mockApiConfig, todoListEnabled: false },
 			})
+			vi.mocked(SYSTEM_PROMPT).mockResolvedValueOnce("mock system prompt")
 
 			await getTaskTestAccess(cline).getSystemPrompt()
 
