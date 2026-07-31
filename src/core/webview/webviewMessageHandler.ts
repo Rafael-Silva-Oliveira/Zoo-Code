@@ -659,6 +659,10 @@ export const webviewMessageHandler = async (
 			telemetrySettingQueue = telemetrySettingQueue
 				.catch(() => undefined)
 				.then(async () => {
+					if (!TelemetryService.hasInstance()) {
+						return
+					}
+
 					const telemetrySetting = getGlobalState("telemetrySetting") || "unset"
 					TelemetryService.instance.updateTelemetryState(
 						isTelemetryOptedIn(telemetrySetting) && vscode.env.isTelemetryEnabled,
